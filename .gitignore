@@ -1,0 +1,14 @@
+# Directorio de compilación de Maven/Gradle (archivos generados)
+target/
+
+# Archivos de configuración y caché del IDE (IntelliJ IDEA en este caso)
+.idea/
+
+# Archivos de configuración de IDEs comunes (puedes añadir otros si usas Eclipse, VS Code, etc.)
+*.iml
+*.iws
+.project
+.classpath
+
+# Registros (logs)
+*.log

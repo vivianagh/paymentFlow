@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: payment-flow
+
+payment:
+  mode: learning   # change to "production" in Sprint 4
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
