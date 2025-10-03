@@ -8,6 +8,7 @@ import com.paymentflow.model.PaymentStatus;
 import com.paymentflow.repository.PaymentRepository;
 import com.paymentflow.service.PaymentService;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Qualifier;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -27,9 +28,18 @@ public class LearningPaymentService implements PaymentService {
     // 4 workers, queue capacity 100
     private final ManualThreadPool pool = new ManualThreadPool(4,100);
 
+    private final ManualCircuitBreaker breaker = new ManualCircuitBreaker(
+            3,
+            100,
+            2
+    );
+    private final ManualRateLimiter limiter = new ManualRateLimiter(20);
+    private final ManualCache<String, UUID> idemCache = new ManualCache<>();
+
+
     public LearningPaymentService(PaymentRepository repository,
-                                  PaymentGateway stripeGateway,
-                                  PaymentGateway payPalGateway) {
+                                  @Qualifier("stripeGateway") PaymentGateway stripeGateway,
+                                  @Qualifier("payPalGateway")  PaymentGateway payPalGateway) {
         this.repository = Objects.requireNonNull(repository);
         this.stripeGateway = stripeGateway;
         this.payPalGateway = payPalGateway;
@@ -37,8 +47,12 @@ public class LearningPaymentService implements PaymentService {
 
     @Override
     public PaymentResult createPayment(PaymentRequest request) {
+        // Idempotency
+        UUID pid = request.idempotencyKey() == null ? UUID.randomUUID()
+                : idemCache.remember(request.idempotencyKey(), key -> UUID.randomUUID());
+
         var payment = new Payment(
-                UUID.randomUUID(),
+                pid,
                 request.amount() != null ? request.amount() : BigDecimal.ZERO,
                 request.currency(),
                 request.method(),
@@ -60,14 +74,39 @@ public class LearningPaymentService implements PaymentService {
     }
 
     private void processAsync(Payment payment) {
+
+        // Circuit breaker fast-fail
+        if (!breaker.allowRequest()) {
+            repository.save(payment.withFailure("CIRCUIT_OPEN"));
+            return;
+        }
+        boolean acquired = false;
+
         try {
+            //Rate limit (concurrency)
+            acquired = limiter.acquire(200); //wait up to 200ms
+            if (acquired) {
+                repository.save(payment.withFailure("RATE_LIMIT"));
+                breaker.recordFailure(); // because we refused to call downstream
+                return;
+            }
             var gw = selectGateway(payment.method());
-            gw.charge(payment);
+            // Retry only for transient gateway exceptions
+            PaymentResult result = ManualRetry.execute(3, 100, () -> gw.charge(payment));
             repository.save(payment.succeed());
+            breaker.recordSuccess();
         } catch (PaymentGateway.GatewayException ge) {
+            breaker.recordFailure();
             repository.save(payment.withFailure(ge.getMessage()));
-        } catch (Throwable t) {
-            repository.save(payment.withFailure("UNEXPECTED: " + t.getClass().getSimpleName()));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            breaker.recordFailure();
+            repository.save(payment.withFailure("INTERRUPTED"));
+        } catch (Exception e) {
+            breaker.recordFailure();
+            repository.save(payment.withFailure("UNEXPECTED: " + e.getClass().getSimpleName()));
+        } finally {
+            if (acquired) limiter.release();
         }
     }
 
